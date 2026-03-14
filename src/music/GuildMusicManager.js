@@ -1,4 +1,5 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import {
   AudioPlayerStatus,
   NoSubscriberBehavior,
@@ -9,8 +10,61 @@ import {
   entersState,
   joinVoiceChannel,
 } from '@discordjs/voice';
-import ffmpegPath from 'ffmpeg-static';
+import ffmpegStaticPath from 'ffmpeg-static';
 import { normalizeDuration, normalizeTrackInfo, runYtDlp } from './ytDlp.js';
+
+const configuredFfmpegPath = process.env.FFMPEG_PATH?.trim();
+
+function getFfmpegCandidates() {
+  if (configuredFfmpegPath) {
+    return [configuredFfmpegPath, 'ffmpeg', ffmpegStaticPath].filter(Boolean);
+  }
+
+  if (process.platform === 'win32') {
+    return ['ffmpeg.exe', 'ffmpeg', ffmpegStaticPath].filter(Boolean);
+  }
+
+  return ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', 'ffmpeg', ffmpegStaticPath].filter(Boolean);
+}
+
+function canExecuteBinary(binary) {
+  const isAbsolutePath = /^(?:[A-Za-z]:\\|\/)/.test(binary);
+  if (isAbsolutePath && !existsSync(binary)) {
+    return false;
+  }
+
+  const result = spawnSync(binary, ['-version'], {
+    encoding: 'utf8',
+    timeout: 4000,
+    windowsHide: true,
+  });
+
+  if (result.error) {
+    return false;
+  }
+
+  return result.status === 0;
+}
+
+function resolveFfmpegBinary() {
+  const candidates = getFfmpegCandidates();
+
+  for (const candidate of candidates) {
+    if (canExecuteBinary(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+const ffmpegPath = resolveFfmpegBinary();
+
+if (ffmpegPath) {
+  console.log(`[ffmpeg] using binary: ${ffmpegPath}`);
+} else {
+  console.warn('[ffmpeg] no usable ffmpeg binary detected. Set FFMPEG_PATH to a valid executable.');
+}
 
 function isLikelyUrl(value) {
   return /^https?:\/\//i.test(value);
@@ -296,7 +350,7 @@ class GuildMusicState {
 
   async createResource(trackUrl) {
     if (!ffmpegPath) {
-      throw new Error('ffmpeg-static binary was not found for this platform.');
+      throw new Error('No usable ffmpeg binary was found. Set FFMPEG_PATH to a valid ffmpeg executable.');
     }
 
     let directUrlOutput;

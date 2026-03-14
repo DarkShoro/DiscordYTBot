@@ -41,6 +41,7 @@ copy .env.example .env
 - `DISCORD_CLIENT_ID`
 - `DISCORD_GUILD_ID` (for guild command deployment)
 - Optional: `YTDLP_PATH` (default is `yt-dlp`)
+- Optional: `FFMPEG_PATH` (path to ffmpeg executable; when omitted the bot auto-detects system ffmpeg and then falls back to `ffmpeg-static`)
 
 4. Deploy slash commands to your test guild:
 
