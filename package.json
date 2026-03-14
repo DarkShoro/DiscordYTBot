@@ -1,0 +1,22 @@
+{
+  "name": "musicbot",
+  "version": "1.0.0",
+  "description": "Discord music bot using discord.js v14 + yt-dlp",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "deploy": "node src/deploy-commands.js",
+    "reset": "node src/reset-commands.js"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.1",
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.3.1",
+    "ffmpeg-static": "^5.3.0",
+    "opusscript": "^0.1.1"
+  }
+}

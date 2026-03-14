@@ -1,0 +1,408 @@
+import { spawn } from 'node:child_process';
+import {
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
+  StreamType,
+  VoiceConnectionStatus,
+  createAudioPlayer,
+  createAudioResource,
+  entersState,
+  joinVoiceChannel,
+} from '@discordjs/voice';
+import ffmpegPath from 'ffmpeg-static';
+import { normalizeDuration, normalizeTrackInfo, runYtDlp } from './ytDlp.js';
+
+function isLikelyUrl(value) {
+  return /^https?:\/\//i.test(value);
+}
+
+function isFormatUnavailableError(error) {
+  const message = String(error?.message || '');
+  return /Requested format is not available|Only images are available/i.test(message);
+}
+
+export class GuildMusicManager {
+  constructor() {
+    this.guildStates = new Map();
+  }
+
+  getState(guildId) {
+    if (!this.guildStates.has(guildId)) {
+      this.guildStates.set(guildId, new GuildMusicState(guildId, () => this.guildStates.delete(guildId)));
+    }
+
+    return this.guildStates.get(guildId);
+  }
+}
+
+class GuildMusicState {
+  constructor(guildId, onCleanup) {
+    this.guildId = guildId;
+    this.onCleanup = onCleanup;
+
+    this.queue = [];
+    this.currentTrack = null;
+    this.connection = null;
+    this.ffmpeg = null;
+
+    this.player = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Pause,
+      },
+    });
+
+    this.player.on(AudioPlayerStatus.Buffering, () => {
+      console.log(`[audio:${this.guildId}] buffering`);
+    });
+
+    this.player.on(AudioPlayerStatus.Playing, () => {
+      console.log(`[audio:${this.guildId}] playing`);
+    });
+
+    this.player.on(AudioPlayerStatus.Paused, () => {
+      console.log(`[audio:${this.guildId}] paused`);
+    });
+
+    this.player.on(AudioPlayerStatus.Idle, () => {
+      console.log(`[audio:${this.guildId}] idle`);
+      this.destroyFfmpeg();
+      this.currentTrack = null;
+      void this.playNext();
+    });
+
+    this.player.on('error', (error) => {
+      console.error(`Audio player error in guild ${this.guildId}:`, error.message);
+      this.destroyFfmpeg();
+      this.currentTrack = null;
+      void this.playNext();
+    });
+  }
+
+  async ensureConnection(voiceChannel) {
+    if (this.connection && this.connection.joinConfig.channelId === voiceChannel.id) {
+      try {
+        await this.waitForConnectionReady(this.connection, 20_000);
+        return;
+      } catch (error) {
+        console.warn(
+          `[voice:${this.guildId}] existing connection was not ready (${error.message}), recreating...`,
+        );
+        this.connection.destroy();
+        this.connection = null;
+      }
+    }
+
+    this.connection?.destroy();
+
+    const maxAttempts = 3;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const connection = joinVoiceChannel({
+        channelId: String(voiceChannel.id),
+        guildId: String(voiceChannel.guild.id),
+        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+        selfDeaf: true,
+      });
+      this.connection = connection;
+
+      connection.subscribe(this.player);
+
+      connection.on('stateChange', (oldState, newState) => {
+        console.log(`[voice:${this.guildId}] ${oldState.status} -> ${newState.status}`);
+      });
+
+      connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        try {
+          await Promise.race([
+            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+          ]);
+        } catch {
+          if (this.connection === connection) {
+            this.stopAndCleanup();
+          }
+        }
+      });
+
+      try {
+        await this.waitForConnectionReady(connection, 20_000);
+        return;
+      } catch (error) {
+        lastError = error;
+        console.warn(
+          `[voice:${this.guildId}] join attempt ${attempt}/${maxAttempts} failed: ${error.message}`,
+        );
+
+        if (this.connection === connection) {
+          connection.destroy();
+          this.connection = null;
+        }
+
+        if (attempt < maxAttempts) {
+          console.warn(`[voice:${this.guildId}] retrying voice join...`);
+        }
+      }
+    }
+
+    throw new Error(
+      `Failed to establish voice connection after ${maxAttempts} attempts. ${lastError?.message || ''}`.trim(),
+    );
+  }
+
+  async waitForConnectionReady(connection, timeoutMs = 45_000) {
+    const start = Date.now();
+    let lastRejoinAt = 0;
+
+    while (Date.now() - start < timeoutMs) {
+      if (!connection) {
+        throw new Error('Voice connection was closed before becoming ready.');
+      }
+
+      if (connection.state.status === VoiceConnectionStatus.Ready) {
+        return;
+      }
+
+      const elapsed = Date.now() - start;
+      if (connection.state.status === VoiceConnectionStatus.Signalling && elapsed - lastRejoinAt >= 7_000) {
+        lastRejoinAt = elapsed;
+        console.warn(`[voice:${this.guildId}] signalling stall detected, forcing rejoin...`);
+        connection.rejoin({
+          channelId: connection.joinConfig.channelId,
+          selfDeaf: connection.joinConfig.selfDeaf,
+          selfMute: connection.joinConfig.selfMute,
+        });
+      }
+
+      const remaining = timeoutMs - (Date.now() - start);
+      const waitSlice = Math.max(1_000, Math.min(5_000, remaining));
+
+      try {
+        await entersState(connection, VoiceConnectionStatus.Ready, waitSlice);
+        return;
+      } catch (error) {
+        if (connection.state.status === VoiceConnectionStatus.Ready) {
+          return;
+        }
+
+        if (connection.state.status === VoiceConnectionStatus.Destroyed) {
+          throw new Error('Voice connection was destroyed while joining the channel.');
+        }
+
+        if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
+          console.warn(
+            `[voice:${this.guildId}] still waiting for ready (status=${connection.state.status || 'unknown'})`,
+          );
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    throw new Error(
+      'Timed out while joining the voice channel. Verify permissions and ensure only one bot process is running.',
+    );
+  }
+
+  async enqueue(input, requestedByTag) {
+    const metadata = await this.resolveTrack(input, requestedByTag);
+
+    this.queue.push(metadata);
+
+    const shouldStart =
+      this.player.state.status !== AudioPlayerStatus.Playing &&
+      this.player.state.status !== AudioPlayerStatus.Buffering &&
+      this.currentTrack === null;
+
+    if (shouldStart) {
+      await this.playNext();
+    }
+
+    return metadata;
+  }
+
+  async enqueueByUrl(url, requestedByTag) {
+    const metadata = await this.resolveTrack(url, requestedByTag);
+
+    this.queue.push(metadata);
+
+    const shouldStart =
+      this.player.state.status !== AudioPlayerStatus.Playing &&
+      this.player.state.status !== AudioPlayerStatus.Buffering &&
+      this.currentTrack === null;
+
+    if (shouldStart) {
+      await this.playNext();
+    }
+
+    return metadata;
+  }
+
+  async resolveTrack(input, requestedByTag) {
+    const target = isLikelyUrl(input) ? input : `ytsearch1:${input}`;
+
+    const output = await runYtDlp(['--dump-single-json', '--no-playlist', '--skip-download', target]);
+    const parsed = JSON.parse(output);
+    const info = normalizeTrackInfo(parsed);
+
+    if (!info) {
+      throw new Error('No playable track found for that query.');
+    }
+
+    return {
+      sourceUrl: info.webpage_url || info.original_url || input,
+      title: info.title || 'Unknown title',
+      durationText: normalizeDuration(Number(info.duration)),
+      requestedByTag,
+    };
+  }
+
+  async searchYouTube(query, limit = 5) {
+    const clampedLimit = Math.max(1, Math.min(10, Number(limit) || 5));
+    const output = await runYtDlp([
+      '--dump-single-json',
+      '--skip-download',
+      '--no-playlist',
+      `ytsearch${clampedLimit}:${query}`,
+    ]);
+
+    const parsed = JSON.parse(output);
+    const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+
+    return entries
+      .filter((entry) => Boolean(entry))
+      .map((entry) => ({
+        sourceUrl: entry.webpage_url || entry.original_url,
+        title: entry.title || 'Unknown title',
+        durationText: normalizeDuration(Number(entry.duration)),
+        channel: entry.channel || entry.uploader || 'Unknown channel',
+      }))
+      .filter((entry) => Boolean(entry.sourceUrl));
+  }
+
+  async playNext() {
+    const track = this.queue.shift();
+
+    if (!track) {
+      return;
+    }
+
+    this.currentTrack = track;
+
+    const resource = await this.createResource(track.sourceUrl);
+    this.player.play(resource);
+  }
+
+  async createResource(trackUrl) {
+    if (!ffmpegPath) {
+      throw new Error('ffmpeg-static binary was not found for this platform.');
+    }
+
+    let directUrlOutput;
+
+    try {
+      directUrlOutput = await runYtDlp(['-f', 'bestaudio/best', '-g', '--no-playlist', trackUrl]);
+    } catch (error) {
+      if (!isFormatUnavailableError(error)) {
+        throw error;
+      }
+
+      console.warn(
+        `[audio:${this.guildId}] bestaudio extraction unavailable, retrying with generic stream selection...`,
+      );
+      directUrlOutput = await runYtDlp(['-g', '--no-playlist', trackUrl]);
+    }
+
+    const directUrl = directUrlOutput
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+
+    if (!directUrl) {
+      throw new Error('yt-dlp did not return a direct audio URL for playback.');
+    }
+
+    console.log(`[audio:${this.guildId}] using direct stream URL from yt-dlp`);
+
+    const ffmpegArgs = [
+      '-reconnect',
+      '1',
+      '-reconnect_streamed',
+      '1',
+      '-reconnect_delay_max',
+      '5',
+      '-i',
+      directUrl,
+      '-f',
+      's16le',
+      '-ar',
+      '48000',
+      '-ac',
+      '2',
+      'pipe:1',
+    ];
+
+    this.ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    this.ffmpeg.stderr.on('data', (chunk) => {
+      const line = chunk.toString().trim();
+      if (line) {
+        console.log(`[ffmpeg:${this.guildId}] ${line}`);
+      }
+    });
+
+    this.ffmpeg.on('close', (code, signal) => {
+      console.log(`[ffmpeg:${this.guildId}] exited with code=${code} signal=${signal}`);
+    });
+
+    this.ffmpeg.on('error', (error) => {
+      console.error(`ffmpeg process error in guild ${this.guildId}:`, error.message);
+    });
+
+    return createAudioResource(this.ffmpeg.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: true,
+      metadata: { trackUrl },
+    });
+  }
+
+  skip() {
+    this.player.stop(true);
+  }
+
+  pause() {
+    return this.player.pause();
+  }
+
+  resume() {
+    return this.player.unpause();
+  }
+
+  stopAndCleanup() {
+    this.queue = [];
+    this.currentTrack = null;
+    this.player.stop(true);
+    this.destroyFfmpeg();
+    this.connection?.destroy();
+    this.connection = null;
+    this.onCleanup();
+  }
+
+  destroyFfmpeg() {
+    if (this.ffmpeg && !this.ffmpeg.killed) {
+      this.ffmpeg.kill('SIGKILL');
+    }
+
+    this.ffmpeg = null;
+  }
+
+  getQueueSnapshot() {
+    return {
+      current: this.currentTrack,
+      upcoming: [...this.queue],
+    };
+  }
+}
