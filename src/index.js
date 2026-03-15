@@ -62,6 +62,20 @@ client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
 });
 
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  const guildId = newState.guild?.id || oldState.guild?.id;
+  if (!guildId) {
+    return;
+  }
+
+  const state = musicManager.getExistingState(guildId);
+  if (!state) {
+    return;
+  }
+
+  state.disconnectIfAlone();
+});
+
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) {
     return;

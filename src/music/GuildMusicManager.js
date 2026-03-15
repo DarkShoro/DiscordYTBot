@@ -80,6 +80,10 @@ export class GuildMusicManager {
     this.guildStates = new Map();
   }
 
+  getExistingState(guildId) {
+    return this.guildStates.get(guildId) || null;
+  }
+
   getState(guildId) {
     if (!this.guildStates.has(guildId)) {
       this.guildStates.set(guildId, new GuildMusicState(guildId, () => this.guildStates.delete(guildId)));
@@ -98,6 +102,7 @@ class GuildMusicState {
     this.currentTrack = null;
     this.connection = null;
     this.ffmpeg = null;
+    this.guild = null;
 
     this.player = createAudioPlayer({
       behaviors: {
@@ -133,6 +138,8 @@ class GuildMusicState {
   }
 
   async ensureConnection(voiceChannel) {
+    this.guild = voiceChannel.guild;
+
     if (this.connection && this.connection.joinConfig.channelId === voiceChannel.id) {
       try {
         await this.waitForConnectionReady(this.connection, 20_000);
@@ -167,6 +174,10 @@ class GuildMusicState {
       });
 
       connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        if (this.connection === connection && this.disconnectIfAlone()) {
+          return;
+        }
+
         try {
           await Promise.race([
             entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
@@ -435,6 +446,31 @@ class GuildMusicState {
     return this.player.unpause();
   }
 
+  disconnectIfAlone() {
+    if (!this.connection || !this.guild) {
+      return false;
+    }
+
+    const channelId = this.connection.joinConfig.channelId;
+    if (!channelId) {
+      return false;
+    }
+
+    const channel = this.guild.channels.cache.get(channelId);
+    if (!channel?.isVoiceBased?.()) {
+      return false;
+    }
+
+    const nonBotMembers = [...channel.members.values()].filter((member) => !member.user.bot);
+    if (nonBotMembers.length > 0) {
+      return false;
+    }
+
+    console.log(`[voice:${this.guildId}] no human listeners left, disconnecting and clearing queue`);
+    this.stopAndCleanup();
+    return true;
+  }
+
   stopAndCleanup() {
     this.queue = [];
     this.currentTrack = null;
@@ -442,6 +478,7 @@ class GuildMusicState {
     this.destroyFfmpeg();
     this.connection?.destroy();
     this.connection = null;
+    this.guild = null;
     this.onCleanup();
   }
 
