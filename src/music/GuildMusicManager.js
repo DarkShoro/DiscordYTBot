@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import path from 'node:path';
 import {
   AudioPlayerStatus,
   NoSubscriberBehavior,
@@ -75,6 +76,10 @@ function isFormatUnavailableError(error) {
   return /Requested format is not available|Only images are available/i.test(message);
 }
 
+function resolveAssetPath(fileName) {
+  return path.resolve(process.cwd(), 'assets', fileName);
+}
+
 export class GuildMusicManager {
   constructor() {
     this.guildStates = new Map();
@@ -143,7 +148,7 @@ class GuildMusicState {
     if (this.connection && this.connection.joinConfig.channelId === voiceChannel.id) {
       try {
         await this.waitForConnectionReady(this.connection, 20_000);
-        return;
+        return false;
       } catch (error) {
         console.warn(
           `[voice:${this.guildId}] existing connection was not ready (${error.message}), recreating...`,
@@ -192,7 +197,7 @@ class GuildMusicState {
 
       try {
         await this.waitForConnectionReady(connection, 20_000);
-        return;
+        return true;
       } catch (error) {
         lastError = error;
         console.warn(
@@ -434,6 +439,74 @@ class GuildMusicState {
     });
   }
 
+  async playConnectedCue() {
+    await this.playLocalCueSafely('connected.wav');
+  }
+
+  async playLocalCueSafely(fileName) {
+    try {
+      await this.playLocalCue(fileName);
+    } catch (error) {
+      console.warn(`[audio:${this.guildId}] failed to play cue ${fileName}: ${error.message}`);
+    }
+  }
+
+  async playLocalCue(fileName) {
+    if (!this.connection) {
+      return;
+    }
+
+    if (!ffmpegPath) {
+      throw new Error('No usable ffmpeg binary was found. Set FFMPEG_PATH to a valid ffmpeg executable.');
+    }
+
+    const cuePath = resolveAssetPath(fileName);
+    if (!existsSync(cuePath)) {
+      throw new Error(`Missing asset file: ${cuePath}`);
+    }
+
+    this.destroyFfmpeg();
+
+    this.ffmpeg = spawn(
+      ffmpegPath,
+      ['-i', cuePath, '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+
+    this.ffmpeg.on('error', (error) => {
+      console.error(`ffmpeg process error in guild ${this.guildId}:`, error.message);
+    });
+
+    const resource = createAudioResource(this.ffmpeg.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: true,
+      metadata: { cue: fileName },
+    });
+
+    await new Promise((resolve, reject) => {
+      const onIdle = () => {
+        cleanup();
+        resolve();
+      };
+
+      const onError = (error) => {
+        cleanup();
+        reject(error);
+      };
+
+      const cleanup = () => {
+        this.player.off(AudioPlayerStatus.Idle, onIdle);
+        this.player.off('error', onError);
+      };
+
+      this.player.on(AudioPlayerStatus.Idle, onIdle);
+      this.player.on('error', onError);
+      this.player.play(resource);
+    });
+  }
+
   skip() {
     this.player.stop(true);
   }
@@ -476,6 +549,22 @@ class GuildMusicState {
     this.currentTrack = null;
     this.player.stop(true);
     this.destroyFfmpeg();
+    this.connection?.destroy();
+    this.connection = null;
+    this.guild = null;
+    this.onCleanup();
+  }
+
+  async stopWithPoweroff() {
+    this.queue = [];
+    this.currentTrack = null;
+    this.player.stop(true);
+    this.destroyFfmpeg();
+
+    if (this.connection) {
+      await this.playLocalCueSafely('poweroff.wav');
+    }
+
     this.connection?.destroy();
     this.connection = null;
     this.guild = null;

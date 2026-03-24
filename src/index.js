@@ -137,7 +137,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        await state.ensureConnection(voiceChannel);
+        const joinedNow = await state.ensureConnection(voiceChannel);
+        if (joinedNow) {
+          await state.playConnectedCue();
+        }
         const track = await state.enqueueByUrl(selected.sourceUrl, interaction.user.tag);
 
         const nowPlaying = state.getQueueSnapshot().current;
@@ -163,7 +166,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         await interaction.deferReply();
-        await state.ensureConnection(voiceChannel);
+        const joinedNow = await state.ensureConnection(voiceChannel);
+        if (joinedNow) {
+          await state.playConnectedCue();
+        }
 
         const input = interaction.options.getString('input', true);
         const track = await state.enqueue(input, interaction.user.tag);
@@ -184,8 +190,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         break;
       }
       case 'stop': {
-        state.stopAndCleanup();
         await interaction.reply('Stopped playback and cleared the queue.');
+        void state.stopWithPoweroff();
         break;
       }
       case 'pause': {
