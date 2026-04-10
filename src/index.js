@@ -287,8 +287,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error('Command handling failed:', error);
 
     const baseMessage = `Something went wrong: ${error.message}`;
-    const ytdlpRelated = /yt-dlp|No playable track/i.test(error.message || '');
-    const message = ytdlpRelated
+    const isBinaryMissing = error?.code === 'ENOENT' || /Failed to start yt-dlp|not found/i.test(error?.message || '');
+    const message = isBinaryMissing
       ? `${baseMessage}\nMake sure yt-dlp is installed and available in PATH (or set YTDLP_PATH).`
       : baseMessage;
 

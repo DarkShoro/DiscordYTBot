@@ -79,6 +79,15 @@ function isFormatUnavailableError(error) {
   return /Requested format is not available|Only images are available/i.test(message);
 }
 
+function isVideoUnavailableError(error) {
+  const message = String(error?.message || '');
+  return /This video is not available|This video has been removed|Private video|Video unavailable/i.test(message);
+}
+
+function isBinaryError(error) {
+  return error?.code === 'ENOENT' || /Failed to start yt-dlp|not found/i.test(error?.message || '');
+}
+
 function resolveAssetPath(fileName) {
   return path.resolve(process.cwd(), 'assets', fileName);
 }
@@ -369,12 +378,59 @@ class GuildMusicState {
   }
 
   async resolveTrack(input, requestedByTag) {
-    const target = isLikelyUrl(input) ? input : `ytsearch1:${input}`;
+    const isUrl = isLikelyUrl(input);
 
+    if (isUrl) {
+      return this._resolveTarget(input, input, requestedByTag);
+    }
+
+    // Try fetching the top 3 results so we can fall back if the first is unavailable.
+    let output;
+    try {
+      output = await runYtDlp(['-f', 'bestaudio/best', '--dump-single-json', '--no-playlist', '--skip-download', `ytsearch3:${input}`]);
+    } catch (error) {
+      if (!isFormatUnavailableError(error)) {
+        throw error;
+      }
+      console.warn(`[yt-dlp:${this.guildId}] bestaudio unavailable during resolve, retrying without format...`);
+      output = await runYtDlp(['--dump-single-json', '--no-playlist', '--skip-download', `ytsearch3:${input}`]);
+    }
+
+    const parsed = JSON.parse(output);
+    const entries = Array.isArray(parsed?.entries) ? parsed.entries.filter(Boolean) : [normalizeTrackInfo(parsed)].filter(Boolean);
+
+    if (entries.length === 0) {
+      throw new Error(`No results found for "${input}".`);
+    }
+
+    for (const info of entries) {
+      if (!info) continue;
+      const directUrl = typeof info.url === 'string' && /^https?:\/\//i.test(info.url) ? info.url : null;
+      // If no direct URL was extracted, the video may be unavailable — skip it.
+      if (!directUrl) {
+        console.warn(`[yt-dlp:${this.guildId}] skipping unavailable result "${info.title || 'unknown'}", trying next...`);
+        continue;
+      }
+      return {
+        sourceUrl: info.webpage_url || info.original_url || input,
+        directUrl,
+        title: info.title || 'Unknown title',
+        durationText: normalizeDuration(Number(info.duration)),
+        requestedByTag,
+      };
+    }
+
+    throw new Error(`No playable results found for "${input}". The top results may be unavailable in your region.`);
+  }
+
+  async _resolveTarget(target, originalInput, requestedByTag) {
     let output;
     try {
       output = await runYtDlp(['-f', 'bestaudio/best', '--dump-single-json', '--no-playlist', '--skip-download', target]);
     } catch (error) {
+      if (isVideoUnavailableError(error)) {
+        throw new Error('That video is not available (region-locked, removed, or private).');
+      }
       if (!isFormatUnavailableError(error)) {
         throw error;
       }
@@ -386,14 +442,13 @@ class GuildMusicState {
     const info = normalizeTrackInfo(parsed);
 
     if (!info) {
-      throw new Error('No playable track found for that query.');
+      throw new Error('No playable track found for that URL.');
     }
 
-    const directUrl =
-      typeof info.url === 'string' && /^https?:\/\//i.test(info.url) ? info.url : null;
+    const directUrl = typeof info.url === 'string' && /^https?:\/\//i.test(info.url) ? info.url : null;
 
     return {
-      sourceUrl: info.webpage_url || info.original_url || input,
+      sourceUrl: info.webpage_url || info.original_url || originalInput,
       directUrl,
       title: info.title || 'Unknown title',
       durationText: normalizeDuration(Number(info.duration)),
