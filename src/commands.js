@@ -27,7 +27,25 @@ export const commandBuilders = [
         .setDescription('YouTube URL or search text')
         .setRequired(true),
     ),
-  new SlashCommandBuilder().setName('skip').setDescription('Skip the current song'),
+  new SlashCommandBuilder()
+    .setName('upload')
+    .setDescription('Upload an mp3 or wav file and add it to the queue')
+    .addAttachmentOption((option) =>
+      option
+        .setName('file')
+        .setDescription('The mp3 or wav file to queue')
+        .setRequired(true),
+    ),
+  new SlashCommandBuilder()
+    .setName('skip')
+    .setDescription('Skip the current song, or remove a queued song by position')
+    .addIntegerOption((option) =>
+      option
+        .setName('position')
+        .setDescription('Queue position to remove (1 = next song). Omit to skip the current song.')
+        .setMinValue(1)
+        .setRequired(false),
+    ),
   new SlashCommandBuilder().setName('stop').setDescription('Stop playback and clear the queue'),
   new SlashCommandBuilder().setName('pause').setDescription('Pause playback'),
   new SlashCommandBuilder().setName('resume').setDescription('Resume playback'),

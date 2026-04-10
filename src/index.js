@@ -184,9 +184,49 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
         break;
       }
+      case 'upload': {
+        if (!voiceChannel) {
+          await interaction.reply({ content: 'Join a voice channel first.', ephemeral: true });
+          return;
+        }
+
+        const permissionIssueUpload = getVoicePermissionIssue(interaction.guild, voiceChannel);
+        if (permissionIssueUpload) {
+          await interaction.reply({ content: permissionIssueUpload, ephemeral: true });
+          return;
+        }
+
+        const attachment = interaction.options.getAttachment('file', true);
+        await interaction.deferReply();
+        const joinedNowUpload = await state.ensureConnection(voiceChannel);
+        if (joinedNowUpload) {
+          await state.playConnectedCue();
+        }
+
+        const uploadTrack = await state.enqueueAttachment(attachment, interaction.user.tag);
+        const nowPlayingUpload = state.getQueueSnapshot().current;
+        const startedNowUpload = nowPlayingUpload?.filePath === uploadTrack.filePath;
+
+        await interaction.editReply(
+          startedNowUpload
+            ? `Now playing: **${uploadTrack.title}**`
+            : `Queued: **${uploadTrack.title}**`,
+        );
+        break;
+      }
       case 'skip': {
-        state.skip();
-        await interaction.reply('Skipped current track.');
+        const position = interaction.options.getInteger('position', false);
+        if (position !== null) {
+          const removed = state.removeFromQueue(position);
+          if (!removed) {
+            await interaction.reply({ content: `No track at position ${position} in the queue.`, ephemeral: true });
+            return;
+          }
+          await interaction.reply(`Removed **${removed.title}** from position ${position} in the queue.`);
+        } else {
+          state.skip();
+          await interaction.reply('Skipped current track.');
+        }
         break;
       }
       case 'stop': {

@@ -1,5 +1,8 @@
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { unlink, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import {
   AudioPlayerStatus,
@@ -129,15 +132,19 @@ class GuildMusicState {
 
     this.player.on(AudioPlayerStatus.Idle, () => {
       console.log(`[audio:${this.guildId}] idle`);
+      const finished = this.currentTrack;
       this.destroyFfmpeg();
       this.currentTrack = null;
+      this.cleanupTempFile(finished);
       void this.playNext();
     });
 
     this.player.on('error', (error) => {
       console.error(`Audio player error in guild ${this.guildId}:`, error.message);
+      const finished = this.currentTrack;
       this.destroyFfmpeg();
       this.currentTrack = null;
+      this.cleanupTempFile(finished);
       void this.playNext();
     });
   }
@@ -309,6 +316,58 @@ class GuildMusicState {
     return metadata;
   }
 
+  async enqueueAttachment(attachment, requestedByTag) {
+    const ALLOWED_EXTENSIONS = ['.mp3', '.wav'];
+    const ALLOWED_TYPES = ['audio/mpeg', 'audio/wav', 'audio/wave', 'audio/x-wav'];
+    const MAX_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
+
+    const ext = path.extname(attachment.name).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.includes(ext)) {
+      throw new Error('Only .mp3 and .wav files are supported.');
+    }
+
+    const contentType = attachment.contentType?.split(';')[0]?.trim()?.toLowerCase() ?? '';
+    if (contentType && !ALLOWED_TYPES.includes(contentType)) {
+      throw new Error('Only mp3 and wav audio files are supported.');
+    }
+
+    if (attachment.size > MAX_SIZE_BYTES) {
+      throw new Error(`File is too large. Maximum allowed size is ${MAX_SIZE_BYTES / 1024 / 1024} MB.`);
+    }
+
+    const response = await fetch(attachment.url);
+    if (!response.ok) {
+      throw new Error(`Failed to download attachment: ${response.statusText}`);
+    }
+
+    const buffer = await response.arrayBuffer();
+    const tempFileName = `musicbot-${crypto.randomUUID()}${ext}`;
+    const tempFilePath = path.join(os.tmpdir(), tempFileName);
+    await writeFile(tempFilePath, Buffer.from(buffer));
+
+    const track = {
+      filePath: tempFilePath,
+      sourceUrl: null,
+      title: attachment.name,
+      durationText: 'uploaded',
+      requestedByTag,
+      isLocalTemp: true,
+    };
+
+    this.queue.push(track);
+
+    const shouldStart =
+      this.player.state.status !== AudioPlayerStatus.Playing &&
+      this.player.state.status !== AudioPlayerStatus.Buffering &&
+      this.currentTrack === null;
+
+    if (shouldStart) {
+      await this.playNext();
+    }
+
+    return track;
+  }
+
   async resolveTrack(input, requestedByTag) {
     const target = isLikelyUrl(input) ? input : `ytsearch1:${input}`;
 
@@ -360,7 +419,9 @@ class GuildMusicState {
 
     this.currentTrack = track;
 
-    const resource = await this.createResource(track.sourceUrl);
+    const resource = track.filePath
+      ? this.createResourceFromFile(track.filePath)
+      : await this.createResource(track.sourceUrl);
     this.player.play(resource);
   }
 
@@ -439,8 +500,42 @@ class GuildMusicState {
     });
   }
 
-  async playConnectedCue() {
-    await this.playLocalCueSafely('connected.wav');
+  createResourceFromFile(filePath) {
+    if (!ffmpegPath) {
+      throw new Error('No usable ffmpeg binary was found. Set FFMPEG_PATH to a valid ffmpeg executable.');
+    }
+
+    this.destroyFfmpeg();
+
+    const ffmpegArgs = ['-i', filePath, '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'];
+
+    this.ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    this.ffmpeg.stderr.on('data', (chunk) => {
+      const line = chunk.toString().trim();
+      if (line) {
+        console.log(`[ffmpeg:${this.guildId}] ${line}`);
+      }
+    });
+
+    this.ffmpeg.on('close', (code, signal) => {
+      console.log(`[ffmpeg:${this.guildId}] exited with code=${code} signal=${signal}`);
+    });
+
+    this.ffmpeg.on('error', (error) => {
+      console.error(`ffmpeg process error in guild ${this.guildId}:`, error.message);
+    });
+
+    return createAudioResource(this.ffmpeg.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: true,
+      metadata: { filePath },
+    });
+  }
+
+  async playConnectedCue() {    await this.playLocalCueSafely('connected.wav');
   }
 
   async playLocalCueSafely(fileName) {
@@ -511,6 +606,16 @@ class GuildMusicState {
     this.player.stop(true);
   }
 
+  removeFromQueue(position) {
+    if (position < 1 || position > this.queue.length) {
+      return null;
+    }
+
+    const [removed] = this.queue.splice(position - 1, 1);
+    this.cleanupTempFile(removed);
+    return removed;
+  }
+
   pause() {
     return this.player.pause();
   }
@@ -545,6 +650,7 @@ class GuildMusicState {
   }
 
   stopAndCleanup() {
+    this.cleanupAllTempFiles();
     this.queue = [];
     this.currentTrack = null;
     this.player.stop(true);
@@ -556,6 +662,7 @@ class GuildMusicState {
   }
 
   async stopWithPoweroff() {
+    this.cleanupAllTempFiles();
     this.queue = [];
     this.currentTrack = null;
     this.player.stop(true);
@@ -577,6 +684,21 @@ class GuildMusicState {
     }
 
     this.ffmpeg = null;
+  }
+
+  cleanupTempFile(track) {
+    if (track?.isLocalTemp && track.filePath) {
+      unlink(track.filePath).catch((err) => {
+        console.warn(`[audio:${this.guildId}] could not delete temp file: ${err.message}`);
+      });
+    }
+  }
+
+  cleanupAllTempFiles() {
+    const tracks = this.currentTrack ? [this.currentTrack, ...this.queue] : [...this.queue];
+    for (const track of tracks) {
+      this.cleanupTempFile(track);
+    }
   }
 
   getQueueSnapshot() {
