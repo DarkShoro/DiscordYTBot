@@ -22,7 +22,7 @@ const ytdlpCandidates = configuredYtDlpPath
   : process.platform === 'win32'
     ? [...localBinCandidates, 'yt-dlp.exe', 'yt-dlp']
     : [...localBinCandidates, 'yt-dlp'];
-const ytdlpDefaultArgs = ['--ignore-config'];
+const ytdlpDefaultArgs = ['--ignore-config', '--no-warnings'];
 
 function formatCommand(binary, args) {
   const escapedArgs = args.map((arg) => {

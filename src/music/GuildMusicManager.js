@@ -371,7 +371,17 @@ class GuildMusicState {
   async resolveTrack(input, requestedByTag) {
     const target = isLikelyUrl(input) ? input : `ytsearch1:${input}`;
 
-    const output = await runYtDlp(['--dump-single-json', '--no-playlist', '--skip-download', target]);
+    let output;
+    try {
+      output = await runYtDlp(['-f', 'bestaudio/best', '--dump-single-json', '--no-playlist', '--skip-download', target]);
+    } catch (error) {
+      if (!isFormatUnavailableError(error)) {
+        throw error;
+      }
+      console.warn(`[yt-dlp:${this.guildId}] bestaudio unavailable during resolve, retrying without format...`);
+      output = await runYtDlp(['--dump-single-json', '--no-playlist', '--skip-download', target]);
+    }
+
     const parsed = JSON.parse(output);
     const info = normalizeTrackInfo(parsed);
 
@@ -379,8 +389,12 @@ class GuildMusicState {
       throw new Error('No playable track found for that query.');
     }
 
+    const directUrl =
+      typeof info.url === 'string' && /^https?:\/\//i.test(info.url) ? info.url : null;
+
     return {
       sourceUrl: info.webpage_url || info.original_url || input,
+      directUrl,
       title: info.title || 'Unknown title',
       durationText: normalizeDuration(Number(info.duration)),
       requestedByTag,
@@ -421,37 +435,68 @@ class GuildMusicState {
 
     const resource = track.filePath
       ? this.createResourceFromFile(track.filePath)
-      : await this.createResource(track.sourceUrl);
+      : await this.createResource(track.sourceUrl, track.directUrl ?? null);
     this.player.play(resource);
+
+    this.prefetchNext();
   }
 
-  async createResource(trackUrl) {
+  prefetchNext() {
+    const next = this.queue[0];
+    if (!next || next.filePath || next.directUrl || next._prefetching) {
+      return;
+    }
+
+    next._prefetching = true;
+    console.log(`[prefetch:${this.guildId}] resolving direct URL for "${next.title}"`);
+
+    runYtDlp(['-f', 'bestaudio/best', '-g', '--no-playlist', next.sourceUrl])
+      .then((output) => {
+        const url = output
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .find((l) => l.length > 0);
+        if (url) {
+          next.directUrl = url;
+          console.log(`[prefetch:${this.guildId}] cached direct URL for "${next.title}"`);
+        }
+      })
+      .catch((err) => {
+        console.warn(`[prefetch:${this.guildId}] prefetch failed for "${next.title}": ${err.message}`);
+      });
+  }
+
+  async createResource(trackUrl, preResolvedUrl = null) {
     if (!ffmpegPath) {
       throw new Error('No usable ffmpeg binary was found. Set FFMPEG_PATH to a valid ffmpeg executable.');
     }
 
-    let directUrlOutput;
-
-    try {
-      directUrlOutput = await runYtDlp(['-f', 'bestaudio/best', '-g', '--no-playlist', trackUrl]);
-    } catch (error) {
-      if (!isFormatUnavailableError(error)) {
-        throw error;
-      }
-
-      console.warn(
-        `[audio:${this.guildId}] bestaudio extraction unavailable, retrying with generic stream selection...`,
-      );
-      directUrlOutput = await runYtDlp(['-g', '--no-playlist', trackUrl]);
-    }
-
-    const directUrl = directUrlOutput
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => line.length > 0);
+    let directUrl = preResolvedUrl;
 
     if (!directUrl) {
-      throw new Error('yt-dlp did not return a direct audio URL for playback.');
+      let directUrlOutput;
+
+      try {
+        directUrlOutput = await runYtDlp(['-f', 'bestaudio/best', '-g', '--no-playlist', trackUrl]);
+      } catch (error) {
+        if (!isFormatUnavailableError(error)) {
+          throw error;
+        }
+
+        console.warn(
+          `[audio:${this.guildId}] bestaudio extraction unavailable, retrying with generic stream selection...`,
+        );
+        directUrlOutput = await runYtDlp(['-g', '--no-playlist', trackUrl]);
+      }
+
+      directUrl = directUrlOutput
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line.length > 0);
+
+      if (!directUrl) {
+        throw new Error('yt-dlp did not return a direct audio URL for playback.');
+      }
     }
 
     console.log(`[audio:${this.guildId}] using direct stream URL from yt-dlp`);
