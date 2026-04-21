@@ -79,6 +79,32 @@ function isFormatUnavailableError(error) {
   return /Requested format is not available|Only images are available/i.test(message);
 }
 
+// Ordered list of format strings to try when the preferred format fails.
+// Falls back from audio-only to combined streams, then no preference at all.
+const FORMAT_FALLBACKS = [
+  ['-f', 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio'],
+  ['-f', 'bestaudio/best'],
+  [], // no format flag — let yt-dlp decide
+];
+
+async function runYtDlpWithFormatFallback(baseArgs, guildId) {
+  let lastError = null;
+  for (const fmtArgs of FORMAT_FALLBACKS) {
+    try {
+      return await runYtDlp([...fmtArgs, ...baseArgs]);
+    } catch (error) {
+      if (!isFormatUnavailableError(error)) {
+        throw error;
+      }
+      lastError = error;
+      if (fmtArgs.length > 0) {
+        console.warn(`[yt-dlp${guildId ? `:${guildId}` : ''}] format unavailable, trying next fallback...`);
+      }
+    }
+  }
+  throw lastError;
+}
+
 function isVideoUnavailableError(error) {
   const message = String(error?.message || '');
   return /This video is not available|This video has been removed|Private video|Video unavailable/i.test(message);
@@ -385,16 +411,10 @@ class GuildMusicState {
     }
 
     // Try fetching the top 3 results so we can fall back if the first is unavailable.
-    let output;
-    try {
-      output = await runYtDlp(['-f', 'bestaudio/best', '--dump-single-json', '--no-playlist', '--skip-download', `ytsearch3:${input}`]);
-    } catch (error) {
-      if (!isFormatUnavailableError(error)) {
-        throw error;
-      }
-      console.warn(`[yt-dlp:${this.guildId}] bestaudio unavailable during resolve, retrying without format...`);
-      output = await runYtDlp(['--dump-single-json', '--no-playlist', '--skip-download', `ytsearch3:${input}`]);
-    }
+    const output = await runYtDlpWithFormatFallback(
+      ['--dump-single-json', '--no-playlist', '--skip-download', `ytsearch3:${input}`],
+      this.guildId,
+    );
 
     const parsed = JSON.parse(output);
     const entries = Array.isArray(parsed?.entries) ? parsed.entries.filter(Boolean) : [normalizeTrackInfo(parsed)].filter(Boolean);
@@ -426,16 +446,15 @@ class GuildMusicState {
   async _resolveTarget(target, originalInput, requestedByTag) {
     let output;
     try {
-      output = await runYtDlp(['-f', 'bestaudio/best', '--dump-single-json', '--no-playlist', '--skip-download', target]);
+      output = await runYtDlpWithFormatFallback(
+        ['--dump-single-json', '--no-playlist', '--skip-download', target],
+        this.guildId,
+      );
     } catch (error) {
       if (isVideoUnavailableError(error)) {
         throw new Error('That video is not available (region-locked, removed, or private).');
       }
-      if (!isFormatUnavailableError(error)) {
-        throw error;
-      }
-      console.warn(`[yt-dlp:${this.guildId}] bestaudio unavailable during resolve, retrying without format...`);
-      output = await runYtDlp(['--dump-single-json', '--no-playlist', '--skip-download', target]);
+      throw error;
     }
 
     const parsed = JSON.parse(output);
