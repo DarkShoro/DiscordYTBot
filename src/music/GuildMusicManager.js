@@ -145,6 +145,8 @@ class GuildMusicState {
     this.currentTrack = null;
     this.connection = null;
     this.ffmpeg = null;
+    this._nextFfmpeg = null;
+    this._nextResource = null;
     this.guild = null;
 
     this.player = createAudioPlayer({
@@ -436,6 +438,8 @@ class GuildMusicState {
         directUrl,
         title: info.title || 'Unknown title',
         durationText: normalizeDuration(Number(info.duration)),
+        thumbnail: info.thumbnail || null,
+        channel: info.channel || info.uploader || null,
         requestedByTag,
       };
     }
@@ -471,6 +475,8 @@ class GuildMusicState {
       directUrl,
       title: info.title || 'Unknown title',
       durationText: normalizeDuration(Number(info.duration)),
+      thumbnail: info.thumbnail || null,
+      channel: info.channel || info.uploader || null,
       requestedByTag,
     };
   }
@@ -494,6 +500,7 @@ class GuildMusicState {
         title: entry.title || 'Unknown title',
         durationText: normalizeDuration(Number(entry.duration)),
         channel: entry.channel || entry.uploader || 'Unknown channel',
+        thumbnail: entry.thumbnail || null,
       }))
       .filter((entry) => Boolean(entry.sourceUrl));
   }
@@ -507,37 +514,96 @@ class GuildMusicState {
 
     this.currentTrack = track;
 
-    const resource = track.filePath
-      ? this.createResourceFromFile(track.filePath)
-      : await this.createResource(track.sourceUrl, track.directUrl ?? null);
-    this.player.play(resource);
+    let resource;
+    if (!track.filePath && this._nextResource) {
+      // ffmpeg is already running and buffering — zero-gap transition
+      console.log(`[audio:${this.guildId}] using pre-buffered resource for "${track.title}"`);
+      this.ffmpeg = this._nextFfmpeg;
+      resource = this._nextResource;
+      this._nextFfmpeg = null;
+      this._nextResource = null;
+    } else {
+      resource = track.filePath
+        ? this.createResourceFromFile(track.filePath)
+        : await this.createResource(track.sourceUrl, track.directUrl ?? null);
+    }
 
-    this.prefetchNext();
+    this.player.play(resource);
+    this._prebufferNext();
   }
 
-  prefetchNext() {
+  _prebufferNext() {
     const next = this.queue[0];
-    if (!next || next.filePath || next.directUrl || next._prefetching) {
+    if (!next || next.filePath || next._prebuffering || this._nextResource) {
       return;
     }
 
-    next._prefetching = true;
-    console.log(`[prefetch:${this.guildId}] resolving direct URL for "${next.title}"`);
+    next._prebuffering = true;
+    console.log(`[prebuffer:${this.guildId}] starting pre-buffer for "${next.title}"`);
 
-    runYtDlp(['-f', 'bestaudio/best', '-g', '--no-playlist', next.sourceUrl])
-      .then((output) => {
-        const url = output
-          .split(/\r?\n/)
-          .map((l) => l.trim())
-          .find((l) => l.length > 0);
-        if (url) {
-          next.directUrl = url;
-          console.log(`[prefetch:${this.guildId}] cached direct URL for "${next.title}"`);
-        }
-      })
-      .catch((err) => {
-        console.warn(`[prefetch:${this.guildId}] prefetch failed for "${next.title}": ${err.message}`);
-      });
+    this._doPrebuffer(next).catch((err) => {
+      next._prebuffering = false;
+      console.warn(`[prebuffer:${this.guildId}] pre-buffer failed for "${next.title}": ${err.message}`);
+    });
+  }
+
+  async _doPrebuffer(track) {
+    if (!ffmpegPath) return;
+
+    let directUrl = track.directUrl;
+    if (!directUrl) {
+      const output = await runYtDlpWithFormatFallback(
+        ['-g', '--no-playlist', track.sourceUrl],
+        this.guildId,
+      );
+      directUrl = output
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l.length > 0);
+      if (!directUrl) throw new Error('yt-dlp -g returned no URL');
+      track.directUrl = directUrl;
+    }
+
+    // Abort if the track was removed from queue while we awaited yt-dlp
+    if (this.queue[0] !== track) {
+      console.log(`[prebuffer:${this.guildId}] "${track.title}" no longer next, discarding`);
+      return;
+    }
+
+    const ffmpegArgs = [
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      '-i', directUrl,
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      'pipe:1',
+    ];
+
+    const proc = spawn(ffmpegPath, ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    proc.stderr.on('data', (chunk) => {
+      const line = chunk.toString().trim();
+      if (line) console.log(`[ffmpeg:${this.guildId}] (pre) ${line}`);
+    });
+
+    proc.on('error', (err) => {
+      console.error(`[prebuffer:${this.guildId}] ffmpeg error: ${err.message}`);
+      if (this._nextFfmpeg === proc) {
+        this._nextFfmpeg = null;
+        this._nextResource = null;
+      }
+    });
+
+    this._nextFfmpeg = proc;
+    this._nextResource = createAudioResource(proc.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: true,
+      metadata: { trackUrl: track.sourceUrl },
+    });
+
+    console.log(`[prebuffer:${this.guildId}] ready for "${track.title}"`);
   }
 
   async createResource(trackUrl, preResolvedUrl = null) {
@@ -732,6 +798,12 @@ class GuildMusicState {
 
     const [removed] = this.queue.splice(position - 1, 1);
     this.cleanupTempFile(removed);
+    // Pre-buffer was prepared for queue position 1; invalidate it if that track was removed,
+    // then immediately start pre-buffering the new queue[0].
+    if (position === 1) {
+      this._destroyNextBuffer();
+      this._prebufferNext();
+    }
     return removed;
   }
 
@@ -773,6 +845,7 @@ class GuildMusicState {
     this.queue = [];
     this.currentTrack = null;
     this.player.stop(true);
+    this._destroyNextBuffer();
     this.destroyFfmpeg();
     this.connection?.destroy();
     this.connection = null;
@@ -785,6 +858,7 @@ class GuildMusicState {
     this.queue = [];
     this.currentTrack = null;
     this.player.stop(true);
+    this._destroyNextBuffer();
     this.destroyFfmpeg();
 
     if (this.connection) {
@@ -795,6 +869,14 @@ class GuildMusicState {
     this.connection = null;
     this.guild = null;
     this.onCleanup();
+  }
+
+  _destroyNextBuffer() {
+    if (this._nextFfmpeg && !this._nextFfmpeg.killed) {
+      this._nextFfmpeg.kill('SIGKILL');
+    }
+    this._nextFfmpeg = null;
+    this._nextResource = null;
   }
 
   destroyFfmpeg() {

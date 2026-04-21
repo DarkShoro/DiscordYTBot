@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Client, Events, GatewayIntentBits, PermissionFlagsBits } from 'discord.js';
+import { Client, EmbedBuilder, Events, GatewayIntentBits, PermissionFlagsBits } from 'discord.js';
 import { GuildMusicManager } from './music/GuildMusicManager.js';
 
 const GUILD_VOICE_STATES = GatewayIntentBits.GuildVoiceStates;
@@ -58,6 +58,45 @@ function getVoicePermissionIssue(guild, voiceChannel) {
   return `Missing voice permissions: ${labels.join(', ')}`;
 }
 
+// --- Embed helpers ---
+const COLORS = {
+  primary: 0x5865F2,
+  success: 0x57F287,
+  warning: 0xFEE75C,
+  danger: 0xED4245,
+};
+
+function buildTrackEmbed({ label, track, extraFields = [] }) {
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.primary)
+    .setAuthor({ name: label })
+    .setTitle(track.title);
+
+  if (track.sourceUrl) embed.setURL(track.sourceUrl);
+  if (track.thumbnail) embed.setThumbnail(track.thumbnail);
+
+  embed.addFields([
+    { name: 'Duration', value: track.durationText || 'unknown', inline: true },
+    { name: 'Requested by', value: track.requestedByTag || 'Unknown', inline: true },
+    ...extraFields,
+  ]);
+
+  if (track.channel) embed.setFooter({ text: track.channel });
+
+  return embed;
+}
+
+function simpleEmbed(color, description) {
+  return new EmbedBuilder().setColor(color).setDescription(description);
+}
+
+function errorEmbed(message) {
+  return new EmbedBuilder()
+    .setColor(COLORS.danger)
+    .setTitle('Something went wrong')
+    .setDescription(message);
+}
+
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
 });
@@ -83,7 +122,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   const guildId = interaction.guildId;
   if (!guildId || !interaction.guild) {
-    await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+    await interaction.reply({ embeds: [simpleEmbed(COLORS.danger, 'This command can only be used in a server.')], ephemeral: true });
     return;
   }
 
@@ -102,38 +141,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const results = await state.searchYouTube(query, 5);
 
         if (results.length === 0) {
-          await interaction.editReply('No YouTube results found.');
+          await interaction.editReply({ embeds: [simpleEmbed(COLORS.primary, 'No YouTube results found.')] });
           return;
         }
 
         if (!pick) {
-          const lines = results.map(
-            (track, index) =>
-              `${index + 1}. ${track.title} (${track.durationText}) - ${track.channel}`,
-          );
+          const description = results
+            .map((r, i) => {
+              const title = r.sourceUrl ? `[${r.title}](${r.sourceUrl})` : r.title;
+              return `\`${i + 1}.\` ${title}\n　${r.channel} • ${r.durationText}`;
+            })
+            .join('\n');
 
-          await interaction.editReply(
-            ['Top YouTube results:', ...lines, 'Use /search with pick:<number> to queue one.'].join(
-              '\n',
-            ),
-          );
+          const embed = new EmbedBuilder()
+            .setColor(COLORS.primary)
+            .setTitle(`Search Results for "${query}"`)
+            .setDescription(description)
+            .setFooter({ text: 'Use /search with pick:<number> to queue one.' });
+
+          await interaction.editReply({ embeds: [embed] });
           return;
         }
 
         if (!voiceChannel) {
-          await interaction.editReply('Join a voice channel first to queue a result.');
+          await interaction.editReply({ embeds: [simpleEmbed(COLORS.warning, 'Join a voice channel first to queue a result.')] });
           return;
         }
 
         const permissionIssue = getVoicePermissionIssue(interaction.guild, voiceChannel);
         if (permissionIssue) {
-          await interaction.editReply(permissionIssue);
+          await interaction.editReply({ embeds: [simpleEmbed(COLORS.danger, permissionIssue)] });
           return;
         }
 
         const selected = results[pick - 1];
         if (!selected) {
-          await interaction.editReply('That pick number is out of range for the current results.');
+          await interaction.editReply({ embeds: [simpleEmbed(COLORS.danger, 'That pick number is out of range for the current results.')] });
           return;
         }
 
@@ -143,25 +186,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         const track = await state.enqueueByUrl(selected.sourceUrl, interaction.user.tag);
 
-        const nowPlaying = state.getQueueSnapshot().current;
-        const startedNow = nowPlaying?.sourceUrl === track.sourceUrl;
+        const snapshot = state.getQueueSnapshot();
+        const startedNow = snapshot.current?.sourceUrl === track.sourceUrl;
+        const queuePos = startedNow ? null : snapshot.upcoming.indexOf(track) + 1;
 
-        await interaction.editReply(
-          startedNow
-            ? `Now playing: **${track.title}** (${track.durationText})`
-            : `Queued: **${track.title}** (${track.durationText})`,
-        );
+        await interaction.editReply({
+          embeds: [buildTrackEmbed({
+            label: startedNow ? '▶ Now Playing' : '🎵 Added to Queue',
+            track,
+            extraFields: startedNow ? [] : [{ name: 'Position', value: `#${queuePos}`, inline: true }],
+          })],
+        });
         break;
       }
       case 'play': {
         if (!voiceChannel) {
-          await interaction.reply({ content: 'Join a voice channel first.', ephemeral: true });
+          await interaction.reply({ embeds: [simpleEmbed(COLORS.warning, 'Join a voice channel first.')], ephemeral: true });
           return;
         }
 
         const permissionIssue = getVoicePermissionIssue(interaction.guild, voiceChannel);
         if (permissionIssue) {
-          await interaction.reply({ content: permissionIssue, ephemeral: true });
+          await interaction.reply({ embeds: [simpleEmbed(COLORS.danger, permissionIssue)], ephemeral: true });
           return;
         }
 
@@ -174,25 +220,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const input = interaction.options.getString('input', true);
         const track = await state.enqueue(input, interaction.user.tag);
 
-        const nowPlaying = state.getQueueSnapshot().current;
-        const startedNow = nowPlaying?.sourceUrl === track.sourceUrl;
+        const snapshot = state.getQueueSnapshot();
+        const startedNow = snapshot.current?.sourceUrl === track.sourceUrl;
+        const queuePos = startedNow ? null : snapshot.upcoming.indexOf(track) + 1;
 
-        await interaction.editReply(
-          startedNow
-            ? `Now playing: **${track.title}** (${track.durationText})`
-            : `Queued: **${track.title}** (${track.durationText})`,
-        );
+        await interaction.editReply({
+          embeds: [buildTrackEmbed({
+            label: startedNow ? '▶ Now Playing' : '🎵 Added to Queue',
+            track,
+            extraFields: startedNow ? [] : [{ name: 'Position', value: `#${queuePos}`, inline: true }],
+          })],
+        });
         break;
       }
       case 'upload': {
         if (!voiceChannel) {
-          await interaction.reply({ content: 'Join a voice channel first.', ephemeral: true });
+          await interaction.reply({ embeds: [simpleEmbed(COLORS.warning, 'Join a voice channel first.')], ephemeral: true });
           return;
         }
 
         const permissionIssueUpload = getVoicePermissionIssue(interaction.guild, voiceChannel);
         if (permissionIssueUpload) {
-          await interaction.reply({ content: permissionIssueUpload, ephemeral: true });
+          await interaction.reply({ embeds: [simpleEmbed(COLORS.danger, permissionIssueUpload)], ephemeral: true });
           return;
         }
 
@@ -204,14 +253,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const uploadTrack = await state.enqueueAttachment(attachment, interaction.user.tag);
-        const nowPlayingUpload = state.getQueueSnapshot().current;
-        const startedNowUpload = nowPlayingUpload?.filePath === uploadTrack.filePath;
+        const uploadSnapshot = state.getQueueSnapshot();
+        const startedNowUpload = uploadSnapshot.current?.filePath === uploadTrack.filePath;
+        const uploadQueuePos = startedNowUpload ? null : uploadSnapshot.upcoming.indexOf(uploadTrack) + 1;
 
-        await interaction.editReply(
-          startedNowUpload
-            ? `Now playing: **${uploadTrack.title}**`
-            : `Queued: **${uploadTrack.title}**`,
-        );
+        await interaction.editReply({
+          embeds: [buildTrackEmbed({
+            label: startedNowUpload ? '▶ Now Playing' : '🎵 Added to Queue',
+            track: uploadTrack,
+            extraFields: startedNowUpload ? [] : [{ name: 'Position', value: `#${uploadQueuePos}`, inline: true }],
+          })],
+        });
         break;
       }
       case 'skip': {
@@ -219,85 +271,106 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (position !== null) {
           const removed = state.removeFromQueue(position);
           if (!removed) {
-            await interaction.reply({ content: `No track at position ${position} in the queue.`, ephemeral: true });
+            await interaction.reply({ embeds: [simpleEmbed(COLORS.danger, `No track at position ${position} in the queue.`)], ephemeral: true });
             return;
           }
-          await interaction.reply(`Removed **${removed.title}** from position ${position} in the queue.`);
+          await interaction.reply({ embeds: [simpleEmbed(COLORS.success, `⏭ Removed **${removed.title}** from position ${position}.`)] });
         } else {
+          const current = state.getQueueSnapshot().current;
           state.skip();
-          await interaction.reply('Skipped current track.');
+          await interaction.reply({ embeds: [simpleEmbed(COLORS.success, current ? `⏭ Skipped **${current.title}**.` : '⏭ Skipped.')] });
         }
         break;
       }
       case 'stop': {
-        await interaction.reply('Stopped playback and cleared the queue.');
+        await interaction.reply({ embeds: [simpleEmbed(COLORS.danger, '⏹ Stopped playback and cleared the queue.')] });
         void state.stopWithPoweroff();
         break;
       }
       case 'pause': {
         const paused = state.pause();
-        await interaction.reply(paused ? 'Paused playback.' : 'Nothing is currently playing.');
+        await interaction.reply({ embeds: [simpleEmbed(COLORS.warning, paused ? '⏸ Paused playback.' : 'Nothing is currently playing.')] });
         break;
       }
       case 'resume': {
         const resumed = state.resume();
-        await interaction.reply(resumed ? 'Resumed playback.' : 'Playback is not paused.');
+        await interaction.reply({ embeds: [simpleEmbed(COLORS.success, resumed ? '▶ Resumed playback.' : 'Playback is not paused.')] });
         break;
       }
       case 'queue': {
         const snapshot = state.getQueueSnapshot();
         if (!snapshot.current && snapshot.upcoming.length === 0) {
-          await interaction.reply('Queue is empty.');
+          await interaction.reply({ embeds: [simpleEmbed(COLORS.primary, 'The queue is empty.')], ephemeral: true });
           return;
         }
 
-        const lines = [];
+        const parts = [];
         if (snapshot.current) {
-          lines.push(`Now: **${snapshot.current.title}** (${snapshot.current.durationText})`);
+          const cur = snapshot.current;
+          const curTitle = cur.sourceUrl ? `[${cur.title}](${cur.sourceUrl})` : cur.title;
+          parts.push(`**Now Playing**\n▶ ${curTitle} \`${cur.durationText}\``);
         }
 
-        snapshot.upcoming.slice(0, 10).forEach((track, index) => {
-          lines.push(`${index + 1}. ${track.title} (${track.durationText})`);
-        });
-
-        const remaining = snapshot.upcoming.length - 10;
-        if (remaining > 0) {
-          lines.push(`...and ${remaining} more.`);
+        if (snapshot.upcoming.length > 0) {
+          const upcomingLines = snapshot.upcoming.slice(0, 10).map((t, i) => {
+            const title = t.sourceUrl ? `[${t.title}](${t.sourceUrl})` : t.title;
+            return `\`${i + 1}.\` ${title} \`${t.durationText}\``;
+          });
+          const remaining = snapshot.upcoming.length - 10;
+          if (remaining > 0) upcomingLines.push(`*...and ${remaining} more*`);
+          parts.push(`**Up Next**\n${upcomingLines.join('\n')}`);
         }
 
-        await interaction.reply(lines.join('\n'));
+        const totalTracks = (snapshot.current ? 1 : 0) + snapshot.upcoming.length;
+        const embed = new EmbedBuilder()
+          .setColor(COLORS.primary)
+          .setTitle(`📋 Queue — ${totalTracks} track${totalTracks !== 1 ? 's' : ''}`)
+          .setDescription(parts.join('\n\n'));
+
+        await interaction.reply({ embeds: [embed] });
         break;
       }
       case 'nowplaying': {
         const snapshot = state.getQueueSnapshot();
         if (!snapshot.current) {
-          await interaction.reply('Nothing is playing right now.');
+          await interaction.reply({ embeds: [simpleEmbed(COLORS.primary, 'Nothing is playing right now.')], ephemeral: true });
           return;
         }
 
-        await interaction.reply(
-          `Now playing: **${snapshot.current.title}** (${snapshot.current.durationText}) · requested by ${snapshot.current.requestedByTag}`,
-        );
+        const cur = snapshot.current;
+        const next = snapshot.upcoming[0];
+        const extraFields = next
+          ? [{ name: 'Up Next', value: next.sourceUrl ? `[${next.title}](${next.sourceUrl})` : next.title, inline: false }]
+          : [];
+
+        await interaction.reply({
+          embeds: [buildTrackEmbed({
+            label: '▶ Now Playing',
+            track: cur,
+            extraFields,
+          })],
+        });
         break;
       }
       default:
-        await interaction.reply({ content: 'Unknown command.', ephemeral: true });
+        await interaction.reply({ embeds: [simpleEmbed(COLORS.danger, 'Unknown command.')], ephemeral: true });
     }
   } catch (error) {
     console.error('Command handling failed:', error);
 
-    const baseMessage = `Something went wrong: ${error.message}`;
+    const baseMessage = error.message;
     const isBinaryMissing = error?.code === 'ENOENT' || /Failed to start yt-dlp|not found/i.test(error?.message || '');
     const message = isBinaryMissing
       ? `${baseMessage}\nMake sure yt-dlp is installed and available in PATH (or set YTDLP_PATH).`
       : baseMessage;
 
+    const embed = errorEmbed(message);
     if (interaction.deferred || interaction.replied) {
-      await interaction.editReply(message);
+      await interaction.editReply({ embeds: [embed] });
       return;
     }
 
-    await interaction.reply({ content: message, ephemeral: true });
+    await interaction.reply({ embeds: [embed], ephemeral: true });
   }
 });
 
