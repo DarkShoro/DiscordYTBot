@@ -515,7 +515,9 @@ class GuildMusicState {
     this.currentTrack = track;
 
     let resource;
-    if (!track.filePath && this._nextResource) {
+    const prebufferHealthy =
+      this._nextFfmpeg === null || this._nextFfmpeg.exitCode === null || this._nextFfmpeg.exitCode === 0;
+    if (!track.filePath && this._nextResource && prebufferHealthy) {
       // ffmpeg is already running and buffering — zero-gap transition
       console.log(`[audio:${this.guildId}] using pre-buffered resource for "${track.title}"`);
       this.ffmpeg = this._nextFfmpeg;
@@ -591,6 +593,14 @@ class GuildMusicState {
     proc.on('error', (err) => {
       console.error(`[prebuffer:${this.guildId}] ffmpeg error: ${err.message}`);
       if (this._nextFfmpeg === proc) {
+        this._nextFfmpeg = null;
+        this._nextResource = null;
+      }
+    });
+
+    proc.on('close', (code) => {
+      if (code !== 0 && this._nextFfmpeg === proc) {
+        console.warn(`[prebuffer:${this.guildId}] pre-buffered ffmpeg exited with code ${code}, discarding stale resource`);
         this._nextFfmpeg = null;
         this._nextResource = null;
       }
