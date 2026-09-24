@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { Client, EmbedBuilder, Events, GatewayIntentBits, PermissionFlagsBits } from 'discord.js';
 import { GuildMusicManager } from './music/GuildMusicManager.js';
+import { normalizeHttpUrl } from './music/ytDlp.js';
 
 const GUILD_VOICE_STATES = GatewayIntentBits.GuildVoiceStates;
 
@@ -72,8 +73,13 @@ function buildTrackEmbed({ label, track, extraFields = [] }) {
     .setAuthor({ name: label })
     .setTitle(track.title);
 
-  if (track.sourceUrl) embed.setURL(track.sourceUrl);
-  if (track.thumbnail) embed.setThumbnail(track.thumbnail);
+  // discord.js rejects non-absolute URLs, so skip anything that cannot be
+  // resolved instead of letting it abort the whole command.
+  const sourceUrl = normalizeHttpUrl(track.sourceUrl);
+  if (sourceUrl) embed.setURL(sourceUrl);
+
+  const thumbnailUrl = normalizeHttpUrl(track.thumbnail, track.sourceUrl);
+  if (thumbnailUrl) embed.setThumbnail(thumbnailUrl);
 
   embed.addFields([
     { name: 'Duration', value: track.durationText || 'unknown', inline: true },

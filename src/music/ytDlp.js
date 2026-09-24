@@ -49,6 +49,46 @@ export function isIdentityGatedHost(value) {
   return hostname === identityGatedHostSuffix || hostname.endsWith(`.${identityGatedHostSuffix}`);
 }
 
+// yt-dlp does not always report absolute URLs: protogen.fr returns thumbnails
+// such as "/assets/media/ugc/<id>/thumbnail.png". discord.js rejects anything
+// that is not an absolute http(s) URL, so resolve relative/reference-style
+// values against the page that referenced them and drop what cannot be fixed.
+function parseHttpUrl(value, base) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const candidate = value.trim();
+  if (!candidate) {
+    return null;
+  }
+
+  try {
+    // A protocol-relative value ("//cdn/x") has no scheme of its own, so it
+    // needs a base; an absolute one parses either way.
+    const parsed = new URL(candidate, base ?? undefined);
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null;
+    }
+
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+export function normalizeHttpUrl(value, baseUrl = null) {
+  const usableBase =
+    typeof baseUrl === 'string' && baseUrl.trim().startsWith('//')
+      ? `https:${baseUrl.trim()}`
+      : baseUrl;
+
+  const base = parseHttpUrl(usableBase, null);
+
+  return parseHttpUrl(value, base);
+}
+
 function withIdentityUserAgent(args) {
   if (!args.some((arg) => isIdentityGatedHost(arg))) {
     return args;

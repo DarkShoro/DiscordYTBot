@@ -19,6 +19,7 @@ import {
   identityUserAgent,
   isIdentityGatedHost,
   normalizeDuration,
+  normalizeHttpUrl,
   normalizeTrackInfo,
   runYtDlp,
 } from './ytDlp.js';
@@ -450,12 +451,13 @@ class GuildMusicState {
         console.warn(`[yt-dlp:${this.guildId}] skipping unavailable result "${info.title || 'unknown'}", trying next...`);
         continue;
       }
+      const sourceUrl = info.webpage_url || info.original_url || input;
       return {
-        sourceUrl: info.webpage_url || info.original_url || input,
+        sourceUrl,
         directUrl,
         title: info.title || 'Unknown title',
         durationText: normalizeDuration(Number(info.duration)),
-        thumbnail: info.thumbnail || null,
+        thumbnail: normalizeHttpUrl(info.thumbnail, sourceUrl),
         channel: info.channel || info.uploader || null,
         requestedByTag,
       };
@@ -486,13 +488,14 @@ class GuildMusicState {
     }
 
     const directUrl = typeof info.url === 'string' && /^https?:\/\//i.test(info.url) ? info.url : null;
+    const sourceUrl = info.webpage_url || info.original_url || originalInput;
 
     return {
-      sourceUrl: info.webpage_url || info.original_url || originalInput,
+      sourceUrl,
       directUrl,
       title: info.title || 'Unknown title',
       durationText: normalizeDuration(Number(info.duration)),
-      thumbnail: info.thumbnail || null,
+      thumbnail: normalizeHttpUrl(info.thumbnail, sourceUrl),
       channel: info.channel || info.uploader || null,
       requestedByTag,
     };
@@ -512,13 +515,17 @@ class GuildMusicState {
 
     return entries
       .filter((entry) => Boolean(entry))
-      .map((entry) => ({
-        sourceUrl: entry.webpage_url || entry.original_url,
-        title: entry.title || 'Unknown title',
-        durationText: normalizeDuration(Number(entry.duration)),
-        channel: entry.channel || entry.uploader || 'Unknown channel',
-        thumbnail: entry.thumbnail || null,
-      }))
+      .map((entry) => {
+        const sourceUrl = entry.webpage_url || entry.original_url;
+
+        return {
+          sourceUrl,
+          title: entry.title || 'Unknown title',
+          durationText: normalizeDuration(Number(entry.duration)),
+          channel: entry.channel || entry.uploader || 'Unknown channel',
+          thumbnail: normalizeHttpUrl(entry.thumbnail, sourceUrl),
+        };
+      })
       .filter((entry) => Boolean(entry.sourceUrl));
   }
 
