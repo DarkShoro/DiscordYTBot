@@ -24,6 +24,39 @@ const ytdlpCandidates = configuredYtDlpPath
     : [...localBinCandidates, 'yt-dlp'];
 const ytdlpDefaultArgs = ['--ignore-config', '--no-warnings'];
 
+// protogen.fr only serves clients that identify themselves as known bots
+// (yt-dlp/youtube-dl/Discordbot/...), so requests to it and its subdomains
+// must carry an identifying User-Agent or the extraction/download is refused.
+const identityGatedHostSuffix = 'protogen.fr';
+
+export const identityUserAgent =
+  process.env.PROTOGEN_USER_AGENT?.trim() ||
+  'Protogen.JAM/1.0 (Discordbot; +https://protogen.fr)';
+
+export function isIdentityGatedHost(value) {
+  if (typeof value !== 'string') {
+    return false;
+  }
+
+  let hostname;
+
+  try {
+    hostname = new URL(value).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+
+  return hostname === identityGatedHostSuffix || hostname.endsWith(`.${identityGatedHostSuffix}`);
+}
+
+function withIdentityUserAgent(args) {
+  if (!args.some((arg) => isIdentityGatedHost(arg))) {
+    return args;
+  }
+
+  return ['--user-agent', identityUserAgent, ...args];
+}
+
 function formatCommand(binary, args) {
   const escapedArgs = args.map((arg) => {
     if (/\s|"/.test(arg)) {
@@ -84,7 +117,7 @@ function runWithBinary(binary, args) {
 }
 
 export async function runYtDlp(args) {
-  const finalArgs = withCookies([...ytdlpDefaultArgs, ...args]);
+  const finalArgs = withCookies([...ytdlpDefaultArgs, ...withIdentityUserAgent(args)]);
   let lastError = null;
 
   for (let i = 0; i < ytdlpCandidates.length; i += 1) {

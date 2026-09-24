@@ -15,7 +15,13 @@ import {
   joinVoiceChannel,
 } from '@discordjs/voice';
 import ffmpegStaticPath from 'ffmpeg-static';
-import { normalizeDuration, normalizeTrackInfo, runYtDlp } from './ytDlp.js';
+import {
+  identityUserAgent,
+  isIdentityGatedHost,
+  normalizeDuration,
+  normalizeTrackInfo,
+  runYtDlp,
+} from './ytDlp.js';
 
 const configuredFfmpegPath = process.env.FFMPEG_PATH?.trim();
 
@@ -77,6 +83,17 @@ function isLikelyUrl(value) {
 function isFormatUnavailableError(error) {
   const message = String(error?.message || '');
   return /Requested format is not available|Only images are available/i.test(message);
+}
+
+// yt-dlp only resolves the media URL; ffmpeg performs the actual stream
+// request. Identity-gated hosts therefore need the identifying User-Agent on
+// the ffmpeg input as well, otherwise it arrives as "Lavf/..." and is refused.
+function withIdentityUserAgentArgs(args, targetUrl) {
+  if (!isIdentityGatedHost(targetUrl)) {
+    return args;
+  }
+
+  return ['-user_agent', identityUserAgent, ...args];
 }
 
 // Ordered list of format strings to try when the preferred format fails.
@@ -572,16 +589,19 @@ class GuildMusicState {
       return;
     }
 
-    const ffmpegArgs = [
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5',
-      '-i', directUrl,
-      '-f', 's16le',
-      '-ar', '48000',
-      '-ac', '2',
-      'pipe:1',
-    ];
+    const ffmpegArgs = withIdentityUserAgentArgs(
+      [
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
+        '-i', directUrl,
+        '-f', 's16le',
+        '-ar', '48000',
+        '-ac', '2',
+        'pipe:1',
+      ],
+      directUrl,
+    );
 
     const proc = spawn(ffmpegPath, ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -651,23 +671,26 @@ class GuildMusicState {
 
     console.log(`[audio:${this.guildId}] using direct stream URL from yt-dlp`);
 
-    const ffmpegArgs = [
-      '-reconnect',
-      '1',
-      '-reconnect_streamed',
-      '1',
-      '-reconnect_delay_max',
-      '5',
-      '-i',
+    const ffmpegArgs = withIdentityUserAgentArgs(
+      [
+        '-reconnect',
+        '1',
+        '-reconnect_streamed',
+        '1',
+        '-reconnect_delay_max',
+        '5',
+        '-i',
+        directUrl,
+        '-f',
+        's16le',
+        '-ar',
+        '48000',
+        '-ac',
+        '2',
+        'pipe:1',
+      ],
       directUrl,
-      '-f',
-      's16le',
-      '-ar',
-      '48000',
-      '-ac',
-      '2',
-      'pipe:1',
-    ];
+    );
 
     this.ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
       stdio: ['ignore', 'pipe', 'pipe'],
