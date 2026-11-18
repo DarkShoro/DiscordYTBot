@@ -8,14 +8,20 @@ if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID) {
   process.exit(1);
 }
 
+const guildIds = DISCORD_GUILD_ID
+  ? DISCORD_GUILD_ID.split(',').map((id) => id.trim()).filter(Boolean)
+  : [];
+
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
 async function resetCommands() {
-  if (DISCORD_GUILD_ID) {
-    await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), {
-      body: [],
-    });
-    console.log(`Cleared guild commands for guild ${DISCORD_GUILD_ID}.`);
+  if (guildIds.length > 0) {
+    for (const guildId of guildIds) {
+      await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, guildId), {
+        body: [],
+      });
+      console.log(`Cleared guild commands for guild ${guildId}.`);
+    }
   } else {
     console.log('DISCORD_GUILD_ID not set, skipping guild command reset.');
   }

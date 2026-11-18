@@ -39,7 +39,7 @@ copy .env.example .env
 
 - `DISCORD_TOKEN`
 - `DISCORD_CLIENT_ID`
-- `DISCORD_GUILD_ID` (for guild command deployment)
+- `DISCORD_GUILD_ID` (for guild command deployment; comma-separated for multiple guilds)
 - Optional: `YTDLP_PATH` (default is `yt-dlp`)
 - Optional: `FFMPEG_PATH` (path to ffmpeg executable; when omitted the bot auto-detects system ffmpeg and then falls back to `ffmpeg-static`)
 - Optional: `PROTOGEN_USER_AGENT` (User-Agent used only for `protogen.fr` requests, default `Protogen.JAM/1.0 (Discordbot; +https://protogen.fr)`)

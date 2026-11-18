@@ -9,14 +9,17 @@ if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID || !DISCORD_GUILD_ID) {
   process.exit(1);
 }
 
+const guildIds = DISCORD_GUILD_ID.split(',').map((id) => id.trim()).filter(Boolean);
+
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
 async function deploy() {
-  await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), {
-    body: commandBuilders,
-  });
-
-  console.log(`Deployed ${commandBuilders.length} guild slash commands.`);
+  for (const guildId of guildIds) {
+    await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, guildId), {
+      body: commandBuilders,
+    });
+    console.log(`Deployed ${commandBuilders.length} guild slash commands to guild ${guildId}.`);
+  }
 }
 
 deploy().catch((error) => {
